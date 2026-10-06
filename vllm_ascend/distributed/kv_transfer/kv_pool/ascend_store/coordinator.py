@@ -29,7 +29,7 @@ _MANAGER_CLASS_CACHE_ATTR = "_manager_class_cache"
 # kwargs every reachable_block_mask implementation must accept. Used when the
 # manager's signature cannot be introspected.
 _REACHABLE_MASK_BASE_KWARGS = frozenset(("start_block", "end_block", "alignment_tokens", "kv_cache_spec", "use_eagle"))
-_REACHABLE_MASK_OPTIONAL_KWARGS = frozenset(("retention_interval", "num_prompt_tokens"))
+_REACHABLE_MASK_OPTIONAL_KWARGS = frozenset(("retention_interval", "num_prompt_tokens", "reachable_boundaries"))
 # manager class -> accepted reachable_block_mask parameter names.
 _REACHABLE_MASK_KWARGS_CACHE: dict[type[SingleTypeKVCacheManager], frozenset[str]] = {}
 
@@ -183,6 +183,14 @@ class AscendStoreCoordinator:
         assert aligned_token_len % self.lcm_block_size == 0, (
             f"aligned_token_len ({aligned_token_len}) must be a multiple of lcm_block_size ({self.lcm_block_size})"
         )
+        # Stores retain the request's replay checkpoint. Lookups must probe
+        # every possible checkpoint: a shorter request may have published a
+        # boundary that is not the current request's replay/segment boundary.
+        reachable_boundaries = (
+            (max(0, num_prompt_tokens - 1),)
+            if num_prompt_tokens is not None
+            else range(self.lcm_block_size, aligned_token_len + 1, self.lcm_block_size)
+        )
         masks: list[tuple[int, list[bool] | None]] = []
         for group_id, spec in enumerate(self.group_effective_specs):
             num_chunks = aligned_token_len // self.group_effective_block_sizes[group_id]
@@ -199,6 +207,7 @@ class AscendStoreCoordinator:
                 use_eagle=group_id in self.eagle_reachable_group_ids,
                 retention_interval=retention_interval,
                 num_prompt_tokens=num_prompt_tokens,
+                reachable_boundaries=reachable_boundaries,
             )
             masks.append((num_chunks, mask))
         return masks
@@ -215,11 +224,8 @@ class AscendStoreCoordinator:
         self,
         aligned_token_len: int,
     ) -> tuple[list[bool] | None, ...]:
-        # Must use the same retention policy as store_mask. The lookup may only
-        # ask for blocks the save path actually persists: a denser lookup mask
-        # queries never-stored blocks, and find_longest_cache_hit turns the
-        # first such hole into a zero-length hit — i.e. no external hit at all,
-        # for every request, no matter how full the pool is.
+        # Probe candidate replay boundaries as well as segment boundaries;
+        # find_longest_cache_hit still requires all necessary states to exist.
         masks = self._reachable_masks(aligned_token_len, self.retention_interval, None)
         for num_chunks, mask in masks:
             if mask is not None:
