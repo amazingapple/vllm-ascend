@@ -19,6 +19,7 @@ from vllm_ascend.ops.triton.glm5_next_lightning_indexer import (  # type: ignore
 if TYPE_CHECKING:
     from vllm_ascend.attention.indexer_kpool import (
         AscendIndexerKPoolMetadata,
+        AscendIndexerKPoolQueryMetadata,
         AscendIndexerKPoolTailMetadata,
     )
 
@@ -81,6 +82,7 @@ class SparseAttnIndexerKpool(nn.Module):
         compute_topk: bool,
         output_buffer: torch.Tensor | None = None,
         allow_cache_packing: bool = True,
+        query_metadata: AscendIndexerKPoolQueryMetadata | None = None,
     ) -> torch.Tensor | None:
         num_tokens = k.shape[0]
         if index_kpool <= 0 or self.topk_tokens % index_kpool:
@@ -129,20 +131,35 @@ class SparseAttnIndexerKpool(nn.Module):
             return None
         if q_values is None or weights is None:
             raise ValueError("GLM KPool top-k requires query and head weights.")
+        query_positions = positions if query_metadata is None else query_metadata.positions
+        query_lens = indexer_metadata.cum_query_lens if query_metadata is None else query_metadata.cum_query_lens
+        # In CP mode the kernel must not pack the causal tail itself: the
+        # sharded query positions make the packed tail wrong, and the padding
+        # rows are cleared below from query_metadata instead.
+        pack_tail = query_metadata is None
         indices = glm5_next_lightning_indexer_triton(
             q_values,
             indexer_cache,
             weights.to(q_values.dtype),
-            indexer_metadata.cum_query_lens,
+            query_lens,
             indexer_metadata.seq_lens,
             indexer_metadata.block_table,
-            positions,
+            query_positions,
             index_topk=self.topk_tokens,
             index_kpool=index_kpool,
             max_pool_seq_len=max_pool_seq_len,
             output_buffer=output_buffer,
-            pack_tail=True,
+            pack_tail=pack_tail,
             allow_cache_packing=allow_cache_packing,
         )
+        if query_metadata is not None:
+            # A2/A3 SFA requires a contiguous valid prefix; the reference
+            # indexer puts the running tail at the fixed top-k column for
+            # short requests. CP shards tokens, so pack the tail in Python
+            # from the sharded query positions instead of the packed kernel.
+            append_causal_tail(indices[:, 0], query_positions, self.topk_tokens, index_kpool)
+            valid = torch.arange(q_values.shape[0], device=k.device) < query_metadata.num_actual_tokens
+            indices.masked_fill_(~valid[:, None, None], -1)
+            return indices
         # Expansion also packs the causal tail and clears every padded row.
         return indices
