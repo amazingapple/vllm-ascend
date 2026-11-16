@@ -14,9 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 from collections.abc import Callable
 
 import torch
+import torch_npu
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
@@ -224,6 +226,27 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         norm_type = 0 if self.scoring_func == "softmax" else 1
         if self.e_score_correction_bias is not None and self.e_score_correction_bias.dtype != router_logits.dtype:
             self.e_score_correction_bias = self.e_score_correction_bias.to(router_logits.dtype)
+        if (
+            os.environ.get("VLLM_ASCEND_FAST_GATING", "0") == "1"
+            and norm_type == 0
+            and renorm == 1
+            and self.e_score_correction_bias is None
+            and topk_group == 1
+            and num_expert_group == 1
+        ):
+            # softmax_v2 只做 softmax + top-k（无 renormalize）。传 fp32 logits 可让
+            # 其内部 softmax 保持在 fp32，再补一次 fp32 top-k 归一化，结果与
+            # MoeGatingTopK(norm_type=0, renorm=1) 逐位一致（含 topk id）。
+            # 实测 [261200,256]: 5.63ms -> 1.70ms。
+            topk_weights, topk_ids = torch_npu.npu_moe_gating_top_k_softmax_v2(
+                router_logits.to(torch.float32), k=self.top_k
+            )[:2]
+            weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+            if self.routed_scaling_factor != 1.0:
+                weights = weights * self.routed_scaling_factor
+            return weights.to(router_logits.dtype), topk_ids.to(
+                torch.int32 if indices_type is None else indices_type
+            )
         topk_weights, topk_ids, _ = DeviceOperator.moe_gating_top_k(
             router_logits,
             k=self.top_k,
