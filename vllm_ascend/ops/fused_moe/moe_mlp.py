@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.moe_grouped_swiglu import grouped_swiglu
 
 
 def apply_moe_mlp(
@@ -92,7 +93,16 @@ def _unified_apply_activation(
             gate, up = hidden_states.chunk(2, dim=-1)
             gate.clamp_(max=mlp_compute_input.swiglu_limit)
             up.clamp_(min=-mlp_compute_input.swiglu_limit, max=mlp_compute_input.swiglu_limit)
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+        else:
+            # 只对前 sum(group_list) 个有效行做 SwiGLU，避免对整块
+            # NUM_ROWS*K padding 缓冲区做逐元素计算；失败时回退原生算子。
+            grouped_out = grouped_swiglu(
+                hidden_states,
+                mlp_compute_input.group_list,
+                mlp_compute_input.group_list_type,
+            )
+            hidden_states = torch_npu.npu_swiglu(hidden_states) if grouped_out is None else grouped_out
 
     return hidden_states
 

@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -306,6 +307,14 @@ def _select_capacity_and_expert_density_moe_comm_method(
         vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
     )
     num_experts_per_device = num_experts // ep_world_size
+    # 实验开关：A2 默认只用 ALLGATHER；开启后仅在 prefill（token 数超过 MC2
+    # 容量）强制走 ALLTOALL，decode 仍走 MC2，避免 CUDA graph 捕获期同步失败。
+    if (
+        os.environ.get("VLLM_ASCEND_FORCE_ALLTOALL", "0") == "1"
+        and num_tokens is not None
+        and num_tokens > mc2_tokens_capacity
+    ):
+        return MoECommType.ALLTOALL
     if (
         num_experts_per_device <= 24
         and ep_world_size >= 16
