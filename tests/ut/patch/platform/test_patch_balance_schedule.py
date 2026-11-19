@@ -955,3 +955,79 @@ def test_balance_engine_core_hooks(monkeypatch):
             assert pe._engine_core_mod.DPEngineCoreProc is orig
     finally:
         pe._engine_core_mod.DPEngineCoreProc = orig
+
+
+# ---------------------------------------------------------------------------
+# M-RoPE multimodal payload survives prefix-cache hits (#19727)
+# ---------------------------------------------------------------------------
+
+# Scheduler copies that build ``NewRequestData`` themselves. ``recompute_scheduler``
+# and ``scheduler_profiling_chunk`` already forward ``uses_mrope``; these two were
+# re-synced to the pinned vLLM release as part of the fix.
+_MROPE_SCHEDULER_FILES = (
+    "vllm_ascend/patch/platform/patch_balance_schedule.py",
+    "vllm_ascend/core/dyntra_lb_scheduler.py",
+)
+
+
+def _is_new_request_data_from_request(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "from_request"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "NewRequestData"
+    )
+
+
+def test_balance_schedule_forwards_uses_mrope():
+    """Regression guard for #19727.
+
+    ``NewRequestData.from_request`` feeds ``strip_covered_mm_data`` with
+    ``uses_mrope``. With the default ``False``, a request whose video prefix is
+    fully cached loses every payload field, including the ``keep_on_cpu``
+    ``image_grid_thw``/``video_grid_thw`` that M-RoPE needs to build positions,
+    so the second request reusing a cached video prefix kills the engine in
+    ``qwen3_vl.py``. ``BalanceScheduler.schedule`` must forward the model flag.
+    """
+    from vllm_ascend.patch.platform import patch_balance_schedule as pbs
+
+    scheduler = _make_balance_scheduler()
+    scheduler.model_uses_mrope = True
+
+    captured: list[dict] = []
+    real_from_request = pbs.NewRequestData.from_request
+
+    def _spy(request, block_ids, *args, **kwargs):
+        captured.append(kwargs)
+        return real_from_request(request, block_ids, *args, **kwargs)
+
+    for req in _create_requests(1, num_tokens=32, max_tokens=8):
+        scheduler.add_request(req)
+    with patch.object(pbs.NewRequestData, "from_request", side_effect=_spy):
+        out = scheduler.schedule()
+
+    assert out.total_num_scheduled_tokens > 0
+    assert captured, "schedule() did not build any NewRequestData"
+    assert all(kwargs.get("uses_mrope") is True for kwargs in captured)
+
+
+def test_every_scheduler_copy_forwards_uses_mrope():
+    """AST guard so a future re-sync of a copied ``schedule()`` cannot silently
+    drop ``uses_mrope`` again (it is easy to lose when re-copying upstream)."""
+    root = _vllm_ascend_repo_root()
+    if root is None:
+        pytest.skip("not running inside a vllm-ascend source checkout")
+
+    for rel in _MROPE_SCHEDULER_FILES:
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        calls = [node for node in ast.walk(tree) if _is_new_request_data_from_request(node)]
+        assert calls, f"no NewRequestData.from_request call found in {rel}"
+        for call in calls:
+            assert any(kw.arg == "uses_mrope" for kw in call.keywords), (
+                f"{rel}:{call.lineno} builds NewRequestData without forwarding "
+                "uses_mrope; M-RoPE models lose image/video_grid_thw on "
+                "prefix-cache hits (#19727)"
+            )
